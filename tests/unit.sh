@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034 # the variables are read by the functions sourced from nirusleep
 # Quick checks without root: the pieces nirusleep writes, made from fixtures.
 set -euo pipefail
 cd "$(dirname "$0")/.."
