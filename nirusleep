@@ -1,0 +1,700 @@
+#!/bin/sh
+# shellcheck shell=bash
+# nirusleep: sleep that saves to disk. After a while in suspend the machine
+# writes its memory to an encrypted swap file and switches off (hibernate),
+# so a laptop left in a bag keeps its battery and its open work.
+#
+#   nirusleep install [--delay MINUTES] [--on-ac yes|no]   set it up or refresh it
+#   nirusleep delay MINUTES          how long to sleep before hibernating (0: never)
+#   nirusleep remove                 put everything back as it was
+#   nirusleep status [--json]        what is set up
+#   nirusleep doctor                 check every part
+#   nirusleep --version
+#
+# Safety rules, kept by every command:
+#   - only on a root file system inside LUKS (the image holds the memory, so it
+#     must be encrypted), and never with kernel lockdown, which forbids it;
+#   - the swap file is its own (btrfs: in a subvolume of its own, so it is in
+#     no snapshot); swap that exists is left alone;
+#   - every kernel's initramfs and every boot entry learn where to resume, so
+#     no entry can start the system without first reading back a saved image;
+#   - every file is made next to its place, checked, and only then moved in;
+#     on any error everything already changed is put back. Originals are kept
+#     in /var/lib/nirusleep/backup. The EFI partition, crypttab, LUKS and the
+#     kernel are never touched.
+#
+# The first lines are plain sh: --version answers without bash.
+VERSION=0.1.0
+case "${1:-}" in --version|version) printf 'nirusleep %s\n' "$VERSION"; exit 0 ;; esac
+if [ -z "${BASH_VERSION:-}" ]; then
+  command -v bash >/dev/null 2>&1 || { echo 'nirusleep: bash is needed' >&2; exit 1; }
+  exec bash "$0" "$@"
+fi
+set -Eeuo pipefail
+umask 022
+PROG=nirusleep
+STATE_DIR=${NIRUSLEEP_STATE_DIR:-/var/lib/nirusleep}
+BACKUP=$STATE_DIR/backup
+STATE=$STATE_DIR/state
+LOG=${NIRUSLEEP_LOG:-/var/log/nirusleep.log}
+GRUB_DEFAULT_FILE=/etc/default/grub
+GRUB_DIR=/boot/grub
+FSTAB=/etc/fstab
+UKI_CMDLINE=/etc/kernel/cmdline
+ARCH_CONF=/etc/mkinitcpio.conf
+DEB_SCRIPT=/etc/initramfs-tools/scripts/local-premount/nirusleep
+DRACUT_CONF=/etc/dracut.conf.d/90-nirusleep.conf
+MARK_BEGIN='# >>> nirusleep (managed block; "nirusleep remove" takes it out)'
+MARK_END='# <<< nirusleep'
+DEFAULT_DELAY=120
+
+say() { printf '%s\n' "$*"; }
+log() { { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; } 2>/dev/null || :; }
+info() { say "$PROG: $*"; log "$*"; }
+warn() { say "$PROG: warning: $*" >&2; log "warning: $*"; }
+IN_TX=
+die() {
+  say "$PROG: $*" >&2
+  log "error: $*"
+  if [ -n "$IN_TX" ]; then IN_TX=; trap - ERR; undo_run; say "$PROG: everything was left as it was. Log: $LOG" >&2; fi
+  exit 1
+}
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ── the machine ──────────────────────────────────────────────────────────────
+OS=
+detect_os() {
+  local id like
+  id=$(. /etc/os-release 2>/dev/null && say "${ID:-}")
+  like=$(. /etc/os-release 2>/dev/null && say "${ID_LIKE:-}")
+  case "$id $like" in
+    void*) OS=void ;;
+    arch*|*" arch"*) OS=arch ;;
+    debian*|ubuntu*|*debian*) OS=debian ;;
+    *) OS=other ;;
+  esac
+}
+
+MKCONFIG=
+detect_grub() {
+  MKCONFIG=$(command -v grub-mkconfig || command -v grub2-mkconfig ||
+    { [ -x /usr/sbin/grub-mkconfig ] && say /usr/sbin/grub-mkconfig; } || :)
+  [ -n "$MKCONFIG" ] && [ -f "$GRUB_DIR/grub.cfg" ] && [ -f "$GRUB_DEFAULT_FILE" ]
+}
+
+# The root file system: its device without a btrfs subvolume suffix, its type
+# and its UUID (the file system's, inside LUKS).
+ROOT_DEV='' ROOT_FS='' ROOT_UUID=''
+detect_root() {
+  ROOT_DEV=$(findmnt -no SOURCE / | sed 's/\[.*\]$//')
+  ROOT_FS=$(findmnt -no FSTYPE /)
+  ROOT_UUID=$(findmnt -no UUID / 2>/dev/null || :)
+  [ -n "$ROOT_UUID" ] || ROOT_UUID=$(blkid -s UUID -o value "$ROOT_DEV" 2>/dev/null || :)
+}
+
+# True when the root device sits on LUKS (a dm-crypt mapping somewhere below).
+root_encrypted() {
+  lsblk -s -no TYPE "$ROOT_DEV" 2>/dev/null | grep -qx crypt
+}
+
+lockdown() {
+  sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/security/lockdown 2>/dev/null || say none
+}
+
+mem_mib() { awk '/^MemTotal:/ {print int(($2 + 1023) / 1024)}' /proc/meminfo; }
+
+# The swap file's size: the memory, rounded up to whole GiB. The image is
+# compressed and usually far smaller; this is the size that always fits.
+swap_mib() { local m; m=$(mem_mib); say $(( (m + 1023) / 1024 * 1024 )); }
+
+kernels() {
+  case "$OS" in
+    debian|void) ls /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | sort -V ;;
+    arch) ls /usr/lib/modules 2>/dev/null | sort -V ;;
+  esac
+}
+
+uses_systemd() { [ -d /run/systemd/system ]; }
+
+# ── state ────────────────────────────────────────────────────────────────────
+state_get() { [ -f "$STATE" ] && sed -n "s/^$1=//p" "$STATE" | tail -1 || :; }
+state_write() {
+  mkdir -p "$STATE_DIR"
+  { for kv in "$@"; do say "$kv"; done; } > "$STATE.new"
+  mv "$STATE.new" "$STATE"
+}
+
+keep_original() {
+  local f=$1 name
+  name=$(say "$f" | tr / _)
+  mkdir -p "$BACKUP"
+  if [ -e "$f" ]; then
+    [ -e "$BACKUP/$name.orig" ] || cp -a "$f" "$BACKUP/$name.orig"
+  else
+    [ -e "$BACKUP/$name.absent" ] || : > "$BACKUP/$name.absent"
+  fi
+}
+
+restore_original() {
+  local f=$1 name
+  name=$(say "$f" | tr / _)
+  if [ -e "$BACKUP/$name.orig" ]; then
+    cp -a "$BACKUP/$name.orig" "$f.nirusleep-new" && mv "$f.nirusleep-new" "$f"
+    rm -f "$BACKUP/$name.orig"
+  elif [ -e "$BACKUP/$name.absent" ]; then
+    rm -f "$f" "$BACKUP/$name.absent"
+  fi
+}
+
+# ── undo while installing ────────────────────────────────────────────────────
+UNDO=()
+undo_push() { UNDO+=("$1"); }
+undo_run() {
+  local i
+  [ "${#UNDO[@]}" -gt 0 ] || return 0
+  warn 'putting back what was changed'
+  for ((i = ${#UNDO[@]} - 1; i >= 0; i--)); do
+    eval "${UNDO[$i]}" >> "$LOG" 2>&1 || warn "could not undo: ${UNDO[$i]}"
+  done
+  UNDO=()
+}
+on_error() { local rc=$?; die "failed (exit $rc, line ${1:-?})"; }
+
+# Replace FILE with NEW (made next to it), keeping the old one for undo.
+put_file() {
+  local new=$1 f=$2 tag
+  tag=$(say "$f" | tr / _)
+  if [ -e "$f" ]; then
+    cmp -s "$new" "$f" && { rm -f "$new"; return 1; }
+    cp -a "$f" "$BACKUP/$tag.last"
+    undo_push "cp -a '$BACKUP/$tag.last' '$f'"
+  else
+    undo_push "rm -f '$f'"
+  fi
+  mv "$new" "$f"
+}
+
+strip_block() {
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+    $0 == b {skip = 1; next}
+    $0 == e {skip = 0; next}
+    !skip {print}' "$1"
+}
+
+# FILE with our block replaced by BLOCK (none when empty).
+write_block() {
+  local f=$1 block=$2 new=$1.nirusleep-new
+  keep_original "$f"
+  { strip_block "$f"; [ -z "$block" ] || say "$block"; } > "$new"
+  chmod --reference="$f" "$new" 2>/dev/null || chmod 644 "$new"
+  put_file "$new" "$f"
+}
+
+# ── the swap file ────────────────────────────────────────────────────────────
+SWAP_DIR='' SWAP_FILE=''
+# btrfs: the file lives in a subvolume of its own (no snapshot takes it in,
+# no copy-on-write). An existing /swap subvolume (NIRUBOOT makes one on
+# laptops) is used; otherwise nirusleep makes one.
+pick_swap_path() {
+  case "$ROOT_FS" in
+    btrfs)
+      if [ -d /swap ] && btrfs subvolume show /swap >/dev/null 2>&1; then
+        SWAP_DIR=/swap
+      elif [ ! -e /swap ]; then
+        SWAP_DIR=/swap
+      else
+        SWAP_DIR=/.nirusleep-swap
+      fi ;;
+    ext4|xfs) SWAP_DIR=/ ;;
+    *) die "the root file system is $ROOT_FS; nirusleep needs btrfs, ext4 or xfs" ;;
+  esac
+  SWAP_FILE=${SWAP_DIR%/}/nirusleep.swap
+}
+
+made_subvol=''
+make_swap_file() {
+  local mib=$1 free
+  if [ "$ROOT_FS" = btrfs ] && [ ! -e "$SWAP_DIR" ]; then
+    btrfs subvolume create "$SWAP_DIR" >> "$LOG" 2>&1
+    undo_push "btrfs subvolume delete '$SWAP_DIR'"
+    made_subvol=yes
+  fi
+  free=$(df -Pm "${SWAP_DIR}" | awk 'NR == 2 {print $4}')
+  [ "$free" -ge $((mib + 10240)) ] || die "not enough free space: $mib MiB for the swap file and 10 GiB to spare are needed, $free MiB are free"
+  rm -f "$SWAP_FILE.nirusleep-new"
+  case "$ROOT_FS" in
+    btrfs)
+      btrfs filesystem mkswapfile --size "${mib}m" --uuid clear "$SWAP_FILE.nirusleep-new" >> "$LOG" 2>&1 ;;
+    *)
+      fallocate -l "${mib}M" "$SWAP_FILE.nirusleep-new" 2>> "$LOG" ||
+        dd if=/dev/zero of="$SWAP_FILE.nirusleep-new" bs=1M count="$mib" status=none
+      chmod 600 "$SWAP_FILE.nirusleep-new"
+      mkswap "$SWAP_FILE.nirusleep-new" >> "$LOG" 2>&1 ;;
+  esac
+  chmod 600 "$SWAP_FILE.nirusleep-new"
+  mv "$SWAP_FILE.nirusleep-new" "$SWAP_FILE"
+  undo_push "swapoff '$SWAP_FILE' 2>/dev/null || :; rm -f '$SWAP_FILE'"
+}
+
+swap_active() { swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$1"; }
+
+# Where the file starts on the device, in pages: what resume_offset needs.
+swap_offset() {
+  case "$ROOT_FS" in
+    btrfs) btrfs inspect-internal map-swapfile -r "$1" ;;
+    *) filefrag -v "$1" | awk '$1 == "0:" {sub(/\.\./, "", $4); print $4; exit}' ;;
+  esac
+}
+
+fstab_block() {
+  say "$MARK_BEGIN"
+  say "$SWAP_FILE none swap defaults,pri=0 0 0"
+  say "$MARK_END"
+}
+
+# ── the kernel command line ──────────────────────────────────────────────────
+grub_block() {
+  local offset=$1
+  say "$MARK_BEGIN"
+  say '# Every entry, recovery too, resumes from a saved image before it mounts.'
+  say "GRUB_CMDLINE_LINUX=\"\${GRUB_CMDLINE_LINUX:+\$GRUB_CMDLINE_LINUX }resume=UUID=$ROOT_UUID resume_offset=$offset\""
+  say "$MARK_END"
+}
+
+regen_grub_cfg() {
+  local cfg=$GRUB_DIR/grub.cfg new=$GRUB_DIR/grub.cfg.nirusleep-new want=$1
+  "$MKCONFIG" -o "$new" >> "$LOG" 2>&1 || { rm -f "$new"; die 'grub-mkconfig failed (see the log)'; }
+  if command -v grub-script-check >/dev/null 2>&1; then
+    grub-script-check "$new" >> "$LOG" 2>&1 || { rm -f "$new"; die 'the new grub.cfg did not pass grub-script-check'; }
+  fi
+  grep -Eq '^[[:space:]]*(linux|uki|chainloader)([[:space:]]|$)' "$new" || { rm -f "$new"; die 'the new grub.cfg has no kernel entry'; }
+  # Kernel lines in it (not only Unified Kernel Images) must carry the offset.
+  if [ -n "$want" ] && grep -Eq '^[[:space:]]*linux[[:space:]]' "$new"; then
+    if grep -E '^[[:space:]]*linux[[:space:]]' "$new" | grep -vq "resume_offset=$want"; then
+      rm -f "$new"; die 'a kernel entry in the new grub.cfg would not resume'
+    fi
+  fi
+  cp -a "$cfg" "$BACKUP/grub.cfg.last"
+  undo_push "cp -a '$BACKUP/grub.cfg.last' '$cfg'"
+  mv "$new" "$cfg"
+}
+
+uki_in_use() {
+  [ "$OS" = arch ] && [ -f "$UKI_CMDLINE" ] && ls /boot/EFI/Linux/*.efi /efi/EFI/Linux/*.efi >/dev/null 2>&1
+}
+
+# /etc/kernel/cmdline without resume words, plus the new ones (none: remove).
+write_uki_cmdline() {
+  local offset=$1 cur new=$UKI_CMDLINE.nirusleep-new
+  keep_original "$UKI_CMDLINE"
+  cur=$(tr '\n' ' ' < "$UKI_CMDLINE" | tr -s ' ' '\n' | grep -Ev '^(resume|resume_offset)=' | tr '\n' ' ' | sed 's/ *$//')
+  if [ -n "$offset" ]; then
+    printf '%s resume=UUID=%s resume_offset=%s\n' "$cur" "$ROOT_UUID" "$offset" > "$new"
+  else
+    printf '%s\n' "$cur" > "$new"
+  fi
+  put_file "$new" "$UKI_CMDLINE" || :
+}
+
+# ── the initramfs ────────────────────────────────────────────────────────────
+# Arch: busybox initramfs needs the resume hook after encrypt (the systemd
+# hook resumes by itself).
+arch_hooks() {
+  local want=$1 hooks out='' h new=$ARCH_CONF.nirusleep-new
+  hooks=$(sed -n 's/^HOOKS=(\(.*\))/\1/p' "$ARCH_CONF" | tail -1)
+  case " $hooks " in *" systemd "*) return 0 ;; esac
+  for h in $hooks; do
+    [ "$h" = resume ] && continue
+    if [ "$want" = yes ] && [ "$h" = filesystems ]; then out="$out resume"; fi
+    out="$out $h"
+  done
+  if [ "$want" = yes ]; then
+    case " $out " in *" resume "*) ;; *) die "no filesystems hook in $ARCH_CONF; add resume by hand" ;; esac
+    case " $out " in *" encrypt "*resume*) ;; *" sd-encrypt "*resume*) ;; *) die "resume would come before the disk is unlocked in $ARCH_CONF" ;; esac
+  fi
+  keep_original "$ARCH_CONF"
+  sed "s/^HOOKS=(.*)/HOOKS=(${out# })/" "$ARCH_CONF" > "$new"
+  put_file "$new" "$ARCH_CONF" || :
+}
+
+# Debian: initramfs-tools' own resume script only takes a swap partition. This
+# one runs after cryptroot has unlocked the disk and before root is mounted:
+# writing the device to /sys/power/resume reads a saved image back (the
+# offset comes from resume_offset on the command line), or returns at once.
+debian_script() {
+  local new=$DEB_SCRIPT.nirusleep-new
+  mkdir -p "$(dirname "$DEB_SCRIPT")"
+  { say '#!/bin/sh'
+    say '# Written by nirusleep: resume from the swap file inside the encrypted root.'
+    say 'PREREQ=""'
+    say 'prereqs() { echo "$PREREQ"; }'
+    say 'case "$1" in prereqs) prereqs; exit 0 ;; esac'
+    say 'for word in $(cat /proc/cmdline); do'
+    say '  case "$word" in noresume) exit 0 ;; resume_offset=*) offset=${word#resume_offset=} ;; esac'
+    say 'done'
+    say '[ -n "${offset:-}" ] || exit 0'
+    say ". /scripts/functions"
+    say "dev=\$(resolve_device UUID=$ROOT_UUID) || exit 0"
+    say '[ -b "$dev" ] || exit 0'
+    say 'majmin=$(cat "/sys/class/block/$(basename "$(readlink -f "$dev")")/dev" 2>/dev/null) || exit 0'
+    say 'echo "$offset" > /sys/power/resume_offset'
+    say 'echo "$majmin" > /sys/power/resume'
+    say 'exit 0'
+  } > "$new"
+  chmod 755 "$new"
+  put_file "$new" "$DEB_SCRIPT" || :
+}
+
+void_dracut() {
+  local want='add_dracutmodules+=" resume "' new=$DRACUT_CONF.nirusleep-new
+  mkdir -p "$(dirname "$DRACUT_CONF")"
+  printf '%s\n' "$want" > "$new"
+  put_file "$new" "$DRACUT_CONF" || :
+}
+
+# Every kernel: any boot entry must resume before it mounts.
+rebuild_all() {
+  local k
+  case "$OS" in
+    debian) update-initramfs -u -k all >> "$LOG" 2>&1 ;;
+    arch) mkinitcpio -P >> "$LOG" 2>&1 ;;
+    void)
+      for k in /usr/lib/modules/*; do
+        k=${k##*/}
+        [ -f "/boot/vmlinuz-$k" ] || continue
+        dracut --force "/boot/initramfs-$k.img" "$k" >> "$LOG" 2>&1
+      done ;;
+  esac
+}
+
+backup_images() {
+  local f
+  mkdir -p "$BACKUP/images"
+  for f in /boot/initrd.img-* /boot/initramfs-*.img /boot/EFI/Linux/*.efi; do
+    [ -f "$f" ] || continue
+    cp -a "$f" "$BACKUP/images/"
+    undo_push "cp -a '$BACKUP/images/$(basename "$f")' '$f'"
+  done
+}
+
+initramfs_resumes() {
+  local img=$1 list
+  [ -f "$img" ] || return 1
+  case "$OS" in
+    debian) list=$(lsinitramfs "$img" 2>/dev/null) || :
+      case "$list" in *scripts/local-premount/nirusleep*) return 0 ;; esac
+      return 1 ;;
+    arch) list=$(lsinitcpio "$img" 2>/dev/null) || :
+      case "$list" in *hooks/resume*|*systemd-hibernate-resume*) return 0 ;; esac
+      return 1 ;;
+    void) list=$(lsinitrd "$img" 2>/dev/null) || :
+      case "$list" in *resume*) return 0 ;; esac
+      return 1 ;;
+  esac
+}
+
+images() {
+  local k
+  case "$OS" in
+    debian) for k in $(kernels); do say "/boot/initrd.img-$k"; done ;;
+    void) for k in $(kernels); do say "/boot/initramfs-$k.img"; done ;;
+    arch)
+      if uki_in_use; then ls /boot/EFI/Linux/*.efi /efi/EFI/Linux/*.efi 2>/dev/null
+      else
+        for k in /boot/initramfs-*.img; do
+          case "$k" in *fallback*) ;; *) [ ! -f "$k" ] || say "$k" ;; esac
+        done
+      fi ;;
+  esac
+}
+
+# ── suspend, then hibernate ──────────────────────────────────────────────────
+SLEEP_DIR='' LOGIND_DIR=''
+sleep_dirs() {
+  if uses_systemd; then SLEEP_DIR=/etc/systemd/sleep.conf.d; LOGIND_DIR=/etc/systemd/logind.conf.d
+  else SLEEP_DIR=/etc/elogind/sleep.conf.d; LOGIND_DIR=/etc/elogind/logind.conf.d; fi
+}
+
+write_sleep_conf() {
+  local delay=$1 on_ac=$2 new
+  sleep_dirs
+  mkdir -p "$SLEEP_DIR" "$LOGIND_DIR"
+  new=$SLEEP_DIR/90-nirusleep.conf.nirusleep-new
+  { say '# Written by nirusleep (nirusleep delay MINUTES changes it).'
+    say '[Sleep]'
+    say 'AllowHibernation=yes'
+    say 'AllowSuspendThenHibernate=yes'
+    say "HibernateDelaySec=${delay}min"
+    uses_systemd && say "HibernateOnACPower=$on_ac"
+  } > "$new"
+  put_file "$new" "$SLEEP_DIR/90-nirusleep.conf" || :
+  new=$LOGIND_DIR/90-nirusleep.conf.nirusleep-new
+  if [ "$delay" -gt 0 ]; then
+    { say '# Written by nirusleep: closing the lid sleeps, then hibernates.'
+      say '[Login]'
+      say 'HandleLidSwitch=suspend-then-hibernate'
+    } > "$new"
+    put_file "$new" "$LOGIND_DIR/90-nirusleep.conf" || :
+  elif [ -e "$LOGIND_DIR/90-nirusleep.conf" ]; then
+    cp -a "$LOGIND_DIR/90-nirusleep.conf" "$BACKUP/logind.last"
+    undo_push "cp -a '$BACKUP/logind.last' '$LOGIND_DIR/90-nirusleep.conf'"
+    rm -f "$LOGIND_DIR/90-nirusleep.conf" "$new"
+  fi
+}
+
+reload_logind() {
+  if uses_systemd; then
+    systemctl reload systemd-logind >> "$LOG" 2>&1 || systemctl kill -s HUP systemd-logind >> "$LOG" 2>&1 || :
+  else
+    pkill -HUP -x elogind >> "$LOG" 2>&1 || :
+  fi
+}
+
+# Tell the running kernel now; the command line does it from the next start.
+set_live_resume() {
+  local offset=$1 majmin
+  majmin=$(lsblk -no MAJ:MIN "$ROOT_DEV" | head -1 | tr -d ' ')
+  printf '%s\n' "$offset" > /sys/power/resume_offset
+  printf '%s\n' "$majmin" > /sys/power/resume
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+need_root() { [ "$(id -u)" = 0 ] || die "$1 needs root (sudo $PROG $1)"; }
+
+lock() {
+  mkdir -p "$STATE_DIR"
+  exec 9> "$STATE_DIR/lock"
+  command -v flock >/dev/null 2>&1 && { flock -n 9 || die 'another nirusleep is running'; }
+}
+
+valid_minutes() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -le 10080 ]; }
+
+preflight() {
+  detect_os
+  [ "$OS" != other ] || die 'only Debian, Void and Arch are supported'
+  [ ! -f /run/.containerenv ] && [ ! -f /.dockerenv ] || die 'not in a container'
+  grep -qw disk /sys/power/state 2>/dev/null || die 'this kernel cannot hibernate (no "disk" in /sys/power/state)'
+  [ "$(lockdown)" = none ] || die "kernel lockdown ($(lockdown)) forbids hibernation; it comes with Secure Boot"
+  detect_root
+  [ -n "$ROOT_UUID" ] || die 'the root file system has no UUID'
+  root_encrypted || die 'the root file system is not encrypted (LUKS); the memory image would be readable on the disk'
+}
+
+install_cmd() {
+  local delay=$DEFAULT_DELAY on_ac=no
+  [ -z "$(state_get delay)" ] || delay=$(state_get delay)
+  [ -z "$(state_get on_ac)" ] || on_ac=$(state_get on_ac)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --delay) [ $# -ge 2 ] && valid_minutes "$2" || die '--delay needs minutes (0 to 10080)'; delay=$2; shift 2 ;;
+      --on-ac) case "${2:-}" in yes|no) on_ac=$2 ;; *) die '--on-ac is yes or no' ;; esac; shift 2 ;;
+      *) die "install: unknown option $1" ;;
+    esac
+  done
+  need_root install
+  lock
+  mkdir -p "$STATE_DIR" "$BACKUP"
+  log "install $VERSION delay=$delay on_ac=$on_ac"
+  preflight
+  local grub=''
+  detect_grub && grub=1
+  [ -n "$grub" ] || uki_in_use || die 'neither GRUB nor a Unified Kernel Image: the kernel command line cannot be set'
+  local mib offset
+  mib=$(swap_mib)
+
+  IN_TX=1
+  trap 'on_error $LINENO' ERR
+  # 1. The swap file (kept when it is there and big enough).
+  SWAP_FILE=$(state_get file)
+  if [ -n "$SWAP_FILE" ] && [ -f "$SWAP_FILE" ] && [ "$(( $(stat -c %s "$SWAP_FILE") / 1048576 ))" -ge "$mib" ]; then
+    SWAP_DIR=$(dirname "$SWAP_FILE")
+    made_subvol=$(state_get made_subvol)
+  else
+    [ -z "$SWAP_FILE" ] || { swapoff "$SWAP_FILE" 2>/dev/null || :; rm -f "$SWAP_FILE"; }
+    pick_swap_path
+    info "making a $((mib / 1024)) GiB encrypted swap file for the memory image: $SWAP_FILE"
+    make_swap_file "$mib"
+  fi
+  write_block "$FSTAB" "$(fstab_block)" || :
+  swap_active "$SWAP_FILE" || { swapon -p 0 "$SWAP_FILE" >> "$LOG" 2>&1; undo_push "swapoff '$SWAP_FILE'"; }
+  offset=$(swap_offset "$SWAP_FILE")
+  case "$offset" in ''|*[!0-9]*) die "could not find where $SWAP_FILE starts" ;; esac
+  log "swap file $SWAP_FILE offset $offset uuid $ROOT_UUID"
+
+  # 2. Every initramfs resumes before it mounts.
+  local rebuild=''
+  case "$OS" in
+    arch) arch_hooks yes ;;
+    debian) debian_script ;;
+    void) void_dracut ;;
+  esac
+  if [ "$(state_get uuid)/$(state_get offset)/$(state_get version)" != "$ROOT_UUID/$offset/$VERSION" ]; then rebuild=1; fi
+  for img in $(images); do initramfs_resumes "$img" || rebuild=1; done
+
+  # 3. The kernel command line.
+  local changed_cmdline=''
+  if uki_in_use; then
+    write_uki_cmdline "$offset" && changed_cmdline=1 || :
+  fi
+  if [ -n "$grub" ]; then
+    write_block "$GRUB_DEFAULT_FILE" "$(grub_block "$offset")" && changed_cmdline=1 || :
+    # shellcheck disable=SC1090
+    ( set +u; . "$GRUB_DEFAULT_FILE" ) >/dev/null 2>&1 || die "$GRUB_DEFAULT_FILE no longer parses"
+  fi
+  if [ -n "$rebuild" ] || [ -n "$changed_cmdline" ]; then
+    info 'updating the initramfs of every kernel (this takes a little while)...'
+    backup_images
+    rebuild_all || die 'the initramfs could not be rebuilt'
+    for img in $(images); do
+      initramfs_resumes "$img" || die "$img does not resume after the rebuild"
+    done
+  fi
+  [ -z "$grub" ] || regen_grub_cfg "$offset"
+
+  # 4. Suspend, then hibernate after the delay; the lid does the same.
+  write_sleep_conf "$delay" "$on_ac"
+
+  # 5. The running kernel knows it now.
+  set_live_resume "$offset"
+  trap - ERR
+  IN_TX=
+  reload_logind
+  state_write "version=$VERSION" "file=$SWAP_FILE" "size_mib=$mib" "uuid=$ROOT_UUID" "offset=$offset" \
+    "delay=$delay" "on_ac=$on_ac" "made_subvol=${made_subvol:-}" "os=$OS"
+  rm -rf "$BACKUP/images"
+  if [ "$delay" -gt 0 ]; then
+    info "on: after $delay min of sleep the machine hibernates$( [ "$on_ac" = no ] && say ' (on battery)'); the disk password brings everything back"
+  else
+    info 'on: hibernate works (systemctl hibernate); sleep never turns into it (delay 0)'
+  fi
+}
+
+delay_cmd() {
+  local delay=${1:-}
+  valid_minutes "$delay" || die 'delay needs minutes (0 to 10080)'
+  need_root delay
+  [ -f "$STATE" ] || die 'not set up yet: nirusleep install'
+  lock
+  detect_os
+  IN_TX=1
+  trap 'on_error $LINENO' ERR
+  mkdir -p "$BACKUP"
+  write_sleep_conf "$delay" "$(state_get on_ac)"
+  trap - ERR
+  IN_TX=
+  reload_logind
+  sed -i "s/^delay=.*/delay=$delay/" "$STATE"
+  info "delay: $delay min"
+}
+
+remove_cmd() {
+  need_root remove
+  lock
+  [ -f "$STATE" ] || { info 'not set up; nothing to remove'; return 0; }
+  log "remove $VERSION"
+  detect_os
+  detect_root
+  local file
+  file=$(state_get file)
+  sleep_dirs
+  rm -f "$SLEEP_DIR/90-nirusleep.conf" "$LOGIND_DIR/90-nirusleep.conf"
+  reload_logind
+  # The kernel forgets the place first, then the file goes.
+  printf '0\n' > /sys/power/resume_offset 2>/dev/null || :
+  printf '0:0\n' > /sys/power/resume 2>/dev/null || :
+  if [ -n "$file" ]; then
+    swapoff "$file" 2>/dev/null || warn "could not switch off $file (in use?); it stays until the next start"
+  fi
+  strip_block "$FSTAB" > "$FSTAB.nirusleep-new" && mv "$FSTAB.nirusleep-new" "$FSTAB"
+  local grub=''
+  detect_grub && grub=1
+  if [ -n "$grub" ]; then
+    strip_block "$GRUB_DEFAULT_FILE" > "$GRUB_DEFAULT_FILE.nirusleep-new" && mv "$GRUB_DEFAULT_FILE.nirusleep-new" "$GRUB_DEFAULT_FILE"
+  fi
+  if [ -f "$UKI_CMDLINE" ] && grep -q 'resume_offset=' "$UKI_CMDLINE"; then
+    ROOT_UUID='' write_uki_cmdline ''
+  fi
+  case "$OS" in
+    arch) arch_hooks no ;;
+    debian) rm -f "$DEB_SCRIPT" ;;
+    void) rm -f "$DRACUT_CONF" ;;
+  esac
+  info 'updating the initramfs of every kernel...'
+  rebuild_all || warn 'the initramfs could not be rebuilt; run it by hand'
+  [ -z "$grub" ] || regen_grub_cfg ''
+  UNDO=()
+  if [ -n "$file" ]; then
+    rm -f "$file"
+    if [ "$(state_get made_subvol)" = yes ]; then
+      btrfs subvolume delete "$(dirname "$file")" >> "$LOG" 2>&1 || warn "could not delete the subvolume $(dirname "$file")"
+    fi
+  fi
+  rm -f "$STATE"
+  info 'removed: sleep is plain suspend again, the swap file is gone'
+}
+
+status_cmd() {
+  local json=''
+  [ "${1:-}" = --json ] && json=1
+  local on=no file delay on_ac active=no live=no
+  [ -f "$STATE" ] && on=yes
+  file=$(state_get file) delay=$(state_get delay) on_ac=$(state_get on_ac)
+  [ -n "$file" ] && swap_active "$file" && active=yes
+  [ "$(cat /sys/power/resume_offset 2>/dev/null)" = "$(state_get offset)" ] && [ "$on" = yes ] && live=yes
+  if [ -n "$json" ]; then
+    printf '{"on":%s,"file":"%s","delay_minutes":%s,"on_ac":%s,"swap_active":%s,"resume_set":%s}\n' \
+      "$( [ "$on" = yes ] && say true || say false)" "$file" "${delay:-0}" \
+      "$( [ "$on_ac" = yes ] && say true || say false)" \
+      "$( [ "$active" = yes ] && say true || say false)" "$( [ "$live" = yes ] && say true || say false)"
+    return 0
+  fi
+  if [ "$on" != yes ]; then say 'nirusleep: off (sleep is plain suspend)'; return 0; fi
+  say "nirusleep $VERSION: on"
+  say "  swap file  $file ($(( $(state_get size_mib) / 1024 )) GiB, $( [ "$active" = yes ] && say in use || say 'NOT in use'))"
+  if [ "${delay:-0}" -gt 0 ]; then
+    say "  sleep      hibernates after $delay min$( [ "$on_ac" = no ] && say ', on battery only')"
+  else
+    say '  sleep      plain suspend (delay 0); systemctl hibernate still works'
+  fi
+}
+
+ok() { say "  ok   $*"; }
+no() { say "  FAIL $*"; bad=1; }
+hm() { say "  --   $*"; }
+
+doctor_cmd() {
+  local bad='' file offset img
+  say "nirusleep $VERSION doctor"
+  [ -f "$STATE" ] || { hm 'not set up (nirusleep install)'; return 0; }
+  detect_os
+  detect_root
+  file=$(state_get file) offset=$(state_get offset)
+  grep -qw disk /sys/power/state 2>/dev/null && ok 'the kernel can hibernate' || no 'no "disk" in /sys/power/state'
+  [ "$(lockdown)" = none ] && ok 'no kernel lockdown' || no "kernel lockdown $(lockdown) forbids hibernation"
+  root_encrypted && ok 'root file system on LUKS' || no 'root file system not encrypted'
+  [ -f "$file" ] && ok "swap file $file" || no "missing $file"
+  swap_active "$file" && ok 'swap file in use' || no 'swap file not in use (swapon)'
+  [ "$(swap_offset "$file" 2>/dev/null)" = "$offset" ] && ok "swap file starts at $offset" || no "swap file moved: run nirusleep install"
+  [ "$(cat /sys/power/resume_offset 2>/dev/null)" = "$offset" ] && ok 'the running kernel knows where to write' || no '/sys/power/resume_offset differs'
+  if grep -q "resume_offset=$offset" /proc/cmdline; then ok 'this start has resume on its command line'
+  else hm 'resume comes onto the command line from the next start'; fi
+  for img in $(images); do
+    initramfs_resumes "$img" && ok "$img resumes" || no "$img does not resume"
+  done
+  sleep_dirs
+  [ -f "$SLEEP_DIR/90-nirusleep.conf" ] && ok "sleep settings ($SLEEP_DIR)" || no "missing $SLEEP_DIR/90-nirusleep.conf"
+  if [ "$(state_get delay)" -gt 0 ]; then
+    [ -f "$LOGIND_DIR/90-nirusleep.conf" ] && ok 'the lid sleeps, then hibernates' || no "missing $LOGIND_DIR/90-nirusleep.conf"
+  fi
+  [ -z "$bad" ]
+}
+
+case "${1:-}" in
+  install|on) shift; install_cmd "$@" ;;
+  delay) shift; delay_cmd "$@" ;;
+  remove|off) shift; remove_cmd ;;
+  status) shift; status_cmd "$@" ;;
+  doctor) doctor_cmd ;;
+  -h|--help|help|'') usage ;;
+  *) die "unknown command $1 (install, delay, remove, status, doctor)" ;;
+esac
